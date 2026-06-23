@@ -39,8 +39,14 @@ ignored.
 ## Install
 
 ```sh
+cargo install --locked --path .
+# installs `adblock-rust-compat-checker` to ~/.cargo/bin (on your PATH)
+```
+
+Or just build it (binary at `target/release/adblock-rust-compat-checker`):
+
+```sh
 cargo build --release --locked
-# binary at target/release/adblock-rust-compat-checker
 ```
 
 ## Usage
@@ -98,3 +104,8 @@ The pinned adblock-rust version is set in `Cargo.toml`; `ADBLOCK_RUST_VERSION` i
 `src/main.rs` mirrors it for the markdown provenance header. The vendored
 `brave-resources.json` is a manual snapshot from
 `brave/adblock-rust:data/brave/brave-resources.json`.
+
+## License
+
+[MPL-2.0](LICENSE). The vendored `data/brave-resources.json` is from
+[brave/adblock-rust](https://github.com/brave/adblock-rust), also MPL-2.0.
