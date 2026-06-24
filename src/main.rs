@@ -11,6 +11,7 @@
 mod domains;
 mod resources;
 
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use adblock::lists::{
@@ -56,6 +57,8 @@ fn list_tokens(values: &[String]) -> Vec<String> {
 #[derive(serde::Serialize)]
 struct RuleReport {
     rule: String,
+    /// Which source list(s) the rule came from (a rule can appear in more than one).
+    sources: Vec<String>,
     relations: Vec<Relation>,
     supported: bool,
     filter_type: Option<&'static str>,
@@ -114,6 +117,75 @@ fn is_filter_line(line: &str) -> bool {
     !line.is_empty() && !line.starts_with('!') && !line.starts_with('[')
 }
 
+/// A filter-list source: `name` is the short label shown per-rule (e.g. `ubo`), `label`
+/// is the resolved URL/path shown in the report provenance, and `text` is its contents.
+struct Source {
+    name: String,
+    label: String,
+    text: String,
+}
+
+/// Merge all sources into per-rule reports. Identical rule lines are de-duplicated across
+/// sources; a rule's `sources` accumulates every list it appeared in (in source order).
+/// With a `matcher`, only rules related to the domain set are kept; without, all are kept.
+fn collect_reports(
+    sources: &[Source],
+    matcher: Option<&DomainMatcher>,
+    resources: &ResourceChecker,
+) -> Vec<RuleReport> {
+    let mut reports: Vec<RuleReport> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut seen_nonmatch: HashSet<String> = HashSet::new();
+
+    for src in sources {
+        for line in src.text.lines() {
+            let rule = line.trim();
+            if !is_filter_line(rule) {
+                continue;
+            }
+            // Already kept: just record this additional source.
+            if let Some(&i) = index.get(rule) {
+                if !reports[i].sources.contains(&src.name) {
+                    reports[i].sources.push(src.name.clone());
+                }
+                continue;
+            }
+            // Already seen and rejected (didn't match the domain filter): skip re-parsing.
+            if seen_nonmatch.contains(rule) {
+                continue;
+            }
+
+            let (parsed, filter_type, parse_error) = parse(rule);
+            let relations = match matcher {
+                Some(m) => {
+                    let rels = match &parsed {
+                        Some(p) => m.relations_parsed(p),
+                        None => m.relations_raw(rule),
+                    };
+                    if rels.is_empty() {
+                        seen_nonmatch.insert(rule.to_string());
+                        continue;
+                    }
+                    rels
+                }
+                None => Vec::new(),
+            };
+
+            let (supported, reason) = support(rule, &parsed, parse_error, resources);
+            index.insert(rule.to_string(), reports.len());
+            reports.push(RuleReport {
+                rule: rule.to_string(),
+                sources: vec![src.name.clone()],
+                relations,
+                supported,
+                filter_type,
+                reason,
+            });
+        }
+    }
+    reports
+}
+
 fn fetch_list(url: &str) -> Result<String, String> {
     // Cap the response so a hostile or runaway URL can't exhaust memory, and time out
     // so it can't hang the run.
@@ -156,35 +228,49 @@ fn main() {
     };
 
     // Sources can be combined: any mix of --file, --list (preset/URL; comma-separated
-    // and/or repeated), and --url (repeatable). Their rules are merged into one corpus
-    // (duplicates across lists are de-duplicated below).
-    let mut source_labels: Vec<String> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
+    // and/or repeated), and --url (repeatable). Each keeps a short `name` (shown per-rule)
+    // and a resolved `label` (shown in the report provenance).
+    let mut sources: Vec<Source> = Vec::new();
 
     for path in values_of("--file") {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| fatal(&format!("could not read {path}: {e}")));
-        source_labels.push(format!("file {path}"));
-        texts.push(text);
+        sources.push(Source {
+            name: path.clone(),
+            label: format!("file {path}"),
+            text,
+        });
     }
     for token in list_tokens(&values_of("--list")) {
         let url = resolve_list(&token).unwrap_or_else(|e| fatal(&e));
         eprintln!("Fetching {url} ...");
-        texts.push(fetch_list(&url).unwrap_or_else(|e| fatal(&e)));
-        source_labels.push(url);
+        let text = fetch_list(&url).unwrap_or_else(|e| fatal(&e));
+        sources.push(Source {
+            name: token,
+            label: url,
+            text,
+        });
     }
     for url in values_of("--url") {
         eprintln!("Fetching {url} ...");
-        texts.push(fetch_list(&url).unwrap_or_else(|e| fatal(&e)));
-        source_labels.push(url);
+        let text = fetch_list(&url).unwrap_or_else(|e| fatal(&e));
+        sources.push(Source {
+            name: url.clone(),
+            label: url,
+            text,
+        });
     }
 
-    if source_labels.is_empty() {
+    if sources.is_empty() {
         fatal("a filter list is required: --list <ubo|easylist|easyprivacy|URL ...>, --url URL, or --file PATH");
     }
 
-    let source_label = source_labels.join(", ");
-    let text = texts.join("\n");
+    let source_label = sources
+        .iter()
+        .map(|s| s.label.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let multi_source = sources.len() > 1;
 
     // No --domains means "check every rule" (no domain filtering).
     let domains: Option<Vec<String>> = match value_of("--domains") {
@@ -207,42 +293,8 @@ fn main() {
     }
     let matcher = domains.as_ref().map(|d| DomainMatcher::new(d));
     let resource_checker = ResourceChecker::from_embedded();
-    let mut reports: Vec<RuleReport> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
 
-    for line in text.lines() {
-        let rule = line.trim();
-        if !is_filter_line(rule) || !seen.insert(rule.to_string()) {
-            continue;
-        }
-
-        let (parsed, filter_type, parse_error) = parse(rule);
-
-        // With a domain set, keep only related rules; without, keep everything.
-        let relations = match &matcher {
-            Some(m) => {
-                let rels = match &parsed {
-                    Some(p) => m.relations_parsed(p),
-                    None => m.relations_raw(rule),
-                };
-                if rels.is_empty() {
-                    continue;
-                }
-                rels
-            }
-            None => Vec::new(),
-        };
-
-        let (supported, reason) = support(rule, &parsed, parse_error, &resource_checker);
-
-        reports.push(RuleReport {
-            rule: rule.to_string(),
-            relations,
-            supported,
-            filter_type,
-            reason,
-        });
-    }
+    let reports = collect_reports(&sources, matcher.as_ref(), &resource_checker);
 
     if output_json {
         let report = Report {
@@ -258,14 +310,19 @@ fn main() {
     }
 
     if output_markdown {
-        print_markdown(&reports, domains.as_deref(), &source_label);
+        print_markdown(&reports, domains.as_deref(), &source_label, multi_source);
         return;
     }
 
-    print_report(&reports, show_supported, domains.is_some());
+    print_report(&reports, show_supported, domains.is_some(), multi_source);
 }
 
-fn print_report(reports: &[RuleReport], show_supported: bool, domain_filtered: bool) {
+fn print_report(
+    reports: &[RuleReport],
+    show_supported: bool,
+    domain_filtered: bool,
+    multi_source: bool,
+) {
     let supported = reports.iter().filter(|r| r.supported).count();
     let unsupported = reports.len() - supported;
 
@@ -295,7 +352,8 @@ fn print_report(reports: &[RuleReport], show_supported: bool, domain_filtered: b
         println!("\n=== UNSUPPORTED RULES ===");
         for r in unsupported_rules {
             println!(
-                "{}({}) {}",
+                "{}{}({}) {}",
+                source_prefix(r, multi_source),
                 tag_prefix(r),
                 r.reason.as_deref().unwrap_or("?"),
                 r.rule
@@ -307,7 +365,8 @@ fn print_report(reports: &[RuleReport], show_supported: bool, domain_filtered: b
         println!("\n=== SUPPORTED RULES ===");
         for r in reports.iter().filter(|r| r.supported) {
             println!(
-                "{}[{}] {}",
+                "{}{}[{}] {}",
+                source_prefix(r, multi_source),
                 tag_prefix(r),
                 r.filter_type.unwrap_or("?"),
                 r.rule
@@ -336,10 +395,24 @@ fn tag_prefix(r: &RuleReport) -> String {
     }
 }
 
+/// A `<src+src> ` prefix shown only when multiple sources were combined.
+fn source_prefix(r: &RuleReport, multi_source: bool) -> String {
+    if multi_source {
+        format!("<{}> ", r.sources.join("+"))
+    } else {
+        String::new()
+    }
+}
+
 /// Render a deterministic markdown report. Output depends only on the inputs (rules,
 /// domains, source) so re-running on the same data yields identical bytes - safe to
 /// commit and diff.
-fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &str) {
+fn print_markdown(
+    reports: &[RuleReport],
+    domains: Option<&[String]>,
+    source: &str,
+    multi_source: bool,
+) {
     let supported = reports.iter().filter(|r| r.supported).count();
     let unsupported = reports.len() - supported;
     let domain_filtered = domains.is_some();
@@ -390,15 +463,22 @@ fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &s
     if unsupported_rules.is_empty() {
         println!("_None._\n");
     } else {
-        let headers: &[&str] = if domain_filtered {
-            &["Tags", "Reason", "Rule"]
-        } else {
-            &["Reason", "Rule"]
-        };
+        let mut headers: Vec<&str> = Vec::new();
+        if multi_source {
+            headers.push("Source");
+        }
+        if domain_filtered {
+            headers.push("Tags");
+        }
+        headers.push("Reason");
+        headers.push("Rule");
         let rows: Vec<Vec<String>> = unsupported_rules
             .iter()
             .map(|r| {
                 let mut row = Vec::new();
+                if multi_source {
+                    row.push(md_text(&r.sources.join("+")));
+                }
                 if domain_filtered {
                     row.push(tags(r));
                 }
@@ -407,7 +487,7 @@ fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &s
                 row
             })
             .collect();
-        print_table(headers, &rows);
+        print_table(&headers, &rows);
         println!();
     }
 
@@ -417,15 +497,22 @@ fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &s
     if supported_rules.is_empty() {
         println!("_None._");
     } else {
-        let headers: &[&str] = if domain_filtered {
-            &["Tags", "Type", "Rule"]
-        } else {
-            &["Type", "Rule"]
-        };
+        let mut headers: Vec<&str> = Vec::new();
+        if multi_source {
+            headers.push("Source");
+        }
+        if domain_filtered {
+            headers.push("Tags");
+        }
+        headers.push("Type");
+        headers.push("Rule");
         let rows: Vec<Vec<String>> = supported_rules
             .iter()
             .map(|r| {
                 let mut row = Vec::new();
+                if multi_source {
+                    row.push(md_text(&r.sources.join("+")));
+                }
                 if domain_filtered {
                     row.push(tags(r));
                 }
@@ -434,7 +521,7 @@ fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &s
                 row
             })
             .collect();
-        print_table(headers, &rows);
+        print_table(&headers, &rows);
     }
 }
 
@@ -504,6 +591,33 @@ mod tests {
         assert!(resolve_list("nonsense").is_err());
         // A stray flag captured as a value (e.g. `--list --json`) is rejected.
         assert!(resolve_list("--json").is_err());
+    }
+
+    #[test]
+    fn sources_recorded_and_deduped_across_lists() {
+        let resources = ResourceChecker::from_embedded();
+        let sources = vec![
+            Source {
+                name: "a".into(),
+                label: "a".into(),
+                text: "||x.com^\n||shared.com^\n".into(),
+            },
+            Source {
+                name: "b".into(),
+                label: "b".into(),
+                text: "||shared.com^\n||y.com^\n".into(),
+            },
+        ];
+        // No domain filter: every unique rule is kept.
+        let reports = collect_reports(&sources, None, &resources);
+        assert_eq!(reports.len(), 3);
+
+        let shared = reports.iter().find(|r| r.rule == "||shared.com^").unwrap();
+        assert_eq!(shared.sources, vec!["a", "b"]); // present in both, in source order
+        let x = reports.iter().find(|r| r.rule == "||x.com^").unwrap();
+        assert_eq!(x.sources, vec!["a"]);
+        let y = reports.iter().find(|r| r.rule == "||y.com^").unwrap();
+        assert_eq!(y.sources, vec!["b"]);
     }
 
     #[test]

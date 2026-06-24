@@ -94,7 +94,11 @@ header (source, domain set, adblock-rust version, tool version) and Unsupported/
 tables; its output is deterministic, so a committed report only changes when the rules or
 their support actually change. `--json` emits a single object with the same provenance
 (`adblock_version`, `tool`, `tool_version`, `source`, `domains`) plus a `rules` array,
-each entry carrying its rule text, relations, support status, and reason.
+each entry carrying its rule text, `sources`, relations, support status, and reason.
+
+When more than one source is combined, each rule records which list(s) it came from: a
+`sources` array in `--json` (always present), and a `Source` column (markdown) / `<src>`
+prefix (text) shown only in multi-source runs. A rule found in several lists lists them all.
 
 ## Development
 
