@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "adblock-rust-compat-checker-cli"
+name = "adblock-rust-compat"
 version = "0.1.0"
 dependencies = [
  "adblock",

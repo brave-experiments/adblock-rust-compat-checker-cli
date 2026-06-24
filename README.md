@@ -1,4 +1,4 @@
-# adblock-rust-compat-checker-cli
+# adblock-rust-compat
 
 A CLI that finds the rules in a filter list that relate to a given set of domains, and
 reports which ones [adblock-rust](https://github.com/brave/adblock-rust) supports.
@@ -40,10 +40,10 @@ ignored.
 
 ```sh
 cargo install --locked --path .
-# installs `adblock-rust-compat-checker` to ~/.cargo/bin (on your PATH)
+# installs `adblock-rust-compat` to ~/.cargo/bin (on your PATH)
 ```
 
-Or just build it (binary at `target/release/adblock-rust-compat-checker`):
+Or just build it (binary at `target/release/adblock-rust-compat`):
 
 ```sh
 cargo build --release --locked
@@ -51,25 +51,31 @@ cargo build --release --locked
 
 ## Usage
 
-Both a domain set (`--domains`) and a filter list (`--url` or `--file`) are required.
+A filter list is required (`--list`, `--url`, or `--file`). `--domains` is optional;
+omit it to check every rule in the list.
 
 ```sh
-adblock-rust-compat-checker \
-  --url https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt \
-  --domains "youtube.com,youtu.be,googlevideo.com"
+# uBO's list, only YouTube-related rules:
+adblock-rust-compat --list ubo --domains "youtube.com,youtu.be,googlevideo.com"
+
+# EasyList, every rule:
+adblock-rust-compat --list easylist
 ```
 
 See `examples/`.
 
 | Flag | Description |
 |---|---|
-| `--domains LIST` | Comma-separated domains to match (required) |
-| `--url URL` | Fetch the filter list from a URL |
-| `--file PATH` | Read the filter list from a local file (alternative to `--url`) |
+| `--list NAME\|URL` | Source: `ubo`, `easylist`, `easyprivacy`, or an http(s) URL |
+| `--url URL` | Raw URL (alias for `--list URL`) |
+| `--file PATH` | Read the filter list from a local file |
+| `--domains LIST` | Comma-separated domains to match; omit to check every rule |
 | `--markdown` | Emit a markdown report to stdout |
 | `--json` | Emit the full report as JSON to stdout |
 | `--show-supported` | Also list supported rules (text output only) |
 | `-h`, `--help` | Show help |
+
+Exactly one source (`--list`/`--url`/`--file`) is required.
 
 Progress goes to stderr and the report to stdout, so
 `... --markdown > report.md` produces a clean file.
@@ -83,8 +89,9 @@ all subdomains for request targets) plus any specific subdomains used in cosmeti
 The default is a text summary plus the unsupported rules. `--markdown` adds a provenance
 header (source, domain set, adblock-rust version, tool version) and Unsupported/Supported
 tables; its output is deterministic, so a committed report only changes when the rules or
-their support actually change. `--json` emits one object per matched rule with its
-relations, support status, and reason.
+their support actually change. `--json` emits a single object with the same provenance
+(`adblock_version`, `tool`, `tool_version`, `source`, `domains`) plus a `rules` array,
+each entry carrying its rule text, relations, support status, and reason.
 
 ## Development
 

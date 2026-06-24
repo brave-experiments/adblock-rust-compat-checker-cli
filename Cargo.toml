@@ -1,5 +1,5 @@
 [package]
-name = "adblock-rust-compat-checker-cli"
+name = "adblock-rust-compat"
 version = "0.1.0"
 edition = "2021"
 description = "Check which filter-list rules for a set of domains are supported by adblock-rust"
@@ -7,7 +7,7 @@ license = "MPL-2.0"
 readme = "README.md"
 
 [[bin]]
-name = "adblock-rust-compat-checker"
+name = "adblock-rust-compat"
 path = "src/main.rs"
 
 [dependencies]

@@ -5,8 +5,8 @@
 //! a scriptlet or redirect resource, can resolve that resource. Otherwise it is
 //! "unsupported" with a single reason (a parse error, or a missing/restricted resource).
 //!
-//! Run `adblock-rust-compat-checker --help` for usage. A filter list (`--url`/`--file`)
-//! and `--domains` are required.
+//! Run `adblock-rust-compat --help` for usage. A filter list (`--url`/`--file`)
+//! is required; `--domains` is optional (omit to check every rule in the list).
 
 mod domains;
 mod resources;
@@ -24,6 +24,24 @@ use resources::{ResourceChecker, ResourceStatus};
 /// adblock-rust version this tool is built against (keep in sync with Cargo.toml).
 const ADBLOCK_RUST_VERSION: &str = "0.12.x";
 
+const UBO_URL: &str =
+    "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt";
+const EASYLIST_URL: &str = "https://easylist.to/easylist/easylist.txt";
+const EASYPRIVACY_URL: &str = "https://easylist.to/easylist/easyprivacy.txt";
+
+/// Resolve a `--list` value (a preset name or an http(s) URL) to a URL.
+fn resolve_list(value: &str) -> Result<String, String> {
+    match value {
+        "ubo" => Ok(UBO_URL.to_string()),
+        "easylist" => Ok(EASYLIST_URL.to_string()),
+        "easyprivacy" => Ok(EASYPRIVACY_URL.to_string()),
+        v if v.starts_with("http://") || v.starts_with("https://") => Ok(v.to_string()),
+        other => Err(format!(
+            "unknown list '{other}': use ubo, easylist, easyprivacy, or an http(s) URL"
+        )),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct RuleReport {
     rule: String,
@@ -31,6 +49,19 @@ struct RuleReport {
     supported: bool,
     filter_type: Option<&'static str>,
     reason: Option<String>,
+}
+
+/// Top-level `--json` output: provenance (so downstream consumers don't have to restate
+/// the adblock-rust version) plus the per-rule reports. Field order is stable for
+/// deterministic, diff-friendly output.
+#[derive(serde::Serialize)]
+struct Report<'a> {
+    adblock_version: &'static str,
+    tool: &'static str,
+    tool_version: &'static str,
+    source: String,
+    domains: Option<Vec<String>>,
+    rules: &'a [RuleReport],
 }
 
 fn parse_options() -> ParseOptions {
@@ -104,24 +135,40 @@ fn main() {
             .position(|a| a == flag)
             .and_then(|i| args.get(i + 1).cloned())
     };
-    let file = value_of("--file");
+    let list = value_of("--list");
     let url = value_of("--url");
+    let file = value_of("--file");
 
-    let (source_label, text) = match (&file, &url) {
-        (Some(_), Some(_)) => fatal("pass only one of --file or --url"),
-        (Some(path), None) => (
+    let n_sources = [&list, &url, &file].iter().filter(|s| s.is_some()).count();
+    if n_sources == 0 {
+        fatal("a filter list is required: --list <ubo|easylist|easyprivacy|URL>, --url URL, or --file PATH");
+    }
+    if n_sources > 1 {
+        fatal("pass only one of --list, --url, or --file");
+    }
+
+    let (source_label, text) = if let Some(path) = &file {
+        (
             format!("file {path}"),
             std::fs::read_to_string(path)
                 .unwrap_or_else(|e| fatal(&format!("could not read {path}: {e}"))),
-        ),
-        (None, Some(url)) => {
-            eprintln!("Fetching {url} ...");
-            (url.clone(), fetch_list(url).unwrap_or_else(|e| fatal(&e)))
-        }
-        (None, None) => fatal("a filter list is required: pass --url URL or --file PATH"),
+        )
+    } else {
+        // `--list` (preset name or URL), or `--url` (raw URL alias).
+        let resolved = match (&list, &url) {
+            (Some(l), _) => resolve_list(l).unwrap_or_else(|e| fatal(&e)),
+            (_, Some(u)) => u.clone(),
+            _ => unreachable!(),
+        };
+        eprintln!("Fetching {resolved} ...");
+        (
+            resolved.clone(),
+            fetch_list(&resolved).unwrap_or_else(|e| fatal(&e)),
+        )
     };
 
-    let domains: Vec<String> = match value_of("--domains") {
+    // No --domains means "check every rule" (no domain filtering).
+    let domains: Option<Vec<String>> = match value_of("--domains") {
         Some(list) => {
             let v: Vec<String> = list
                 .split(',')
@@ -131,12 +178,15 @@ fn main() {
             if v.is_empty() {
                 fatal("--domains was empty");
             }
-            v
+            Some(v)
         }
-        None => fatal("--domains is required (comma-separated, e.g. youtube.com,youtu.be)"),
+        None => None,
     };
-    eprintln!("Matching domains: {}", domains.join(", "));
-    let matcher = DomainMatcher::new(&domains);
+    match &domains {
+        Some(d) => eprintln!("Matching domains: {}", d.join(", ")),
+        None => eprintln!("No --domains given: checking all rules."),
+    }
+    let matcher = domains.as_ref().map(|d| DomainMatcher::new(d));
     let resource_checker = ResourceChecker::from_embedded();
     let mut reports: Vec<RuleReport> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -149,13 +199,20 @@ fn main() {
 
         let (parsed, filter_type, parse_error) = parse(rule);
 
-        let relations = match &parsed {
-            Some(p) => matcher.relations_parsed(p),
-            None => matcher.relations_raw(rule),
+        // With a domain set, keep only related rules; without, keep everything.
+        let relations = match &matcher {
+            Some(m) => {
+                let rels = match &parsed {
+                    Some(p) => m.relations_parsed(p),
+                    None => m.relations_raw(rule),
+                };
+                if rels.is_empty() {
+                    continue;
+                }
+                rels
+            }
+            None => Vec::new(),
         };
-        if relations.is_empty() {
-            continue;
-        }
 
         let (supported, reason) = support(rule, &parsed, parse_error, &resource_checker);
 
@@ -169,45 +226,58 @@ fn main() {
     }
 
     if output_json {
-        println!("{}", serde_json::to_string_pretty(&reports).unwrap());
+        let report = Report {
+            adblock_version: ADBLOCK_RUST_VERSION,
+            tool: env!("CARGO_PKG_NAME"),
+            tool_version: env!("CARGO_PKG_VERSION"),
+            source: source_label.clone(),
+            domains: domains.clone(),
+            rules: &reports,
+        };
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return;
     }
 
     if output_markdown {
-        print_markdown(&reports, &domains, &source_label);
+        print_markdown(&reports, domains.as_deref(), &source_label);
         return;
     }
 
-    print_report(&reports, show_supported);
+    print_report(&reports, show_supported, domains.is_some());
 }
 
-fn print_report(reports: &[RuleReport], show_supported: bool) {
+fn print_report(reports: &[RuleReport], show_supported: bool, domain_filtered: bool) {
     let supported = reports.iter().filter(|r| r.supported).count();
     let unsupported = reports.len() - supported;
-    let targets = reports
-        .iter()
-        .filter(|r| r.relations.contains(&Relation::Target))
-        .count();
-    let scopes = reports
-        .iter()
-        .filter(|r| r.relations.contains(&Relation::Scope))
-        .count();
 
-    println!(
-        "Matching rules: {}  (target: {targets}, scope: {scopes})",
-        reports.len()
-    );
+    if domain_filtered {
+        let targets = reports
+            .iter()
+            .filter(|r| r.relations.contains(&Relation::Target))
+            .count();
+        let scopes = reports
+            .iter()
+            .filter(|r| r.relations.contains(&Relation::Scope))
+            .count();
+        println!(
+            "Matching rules: {}  (target: {targets}, scope: {scopes})",
+            reports.len()
+        );
+    } else {
+        println!("Rules checked:  {}", reports.len());
+    }
     println!("Supported:      {supported}");
     println!("Unsupported:    {unsupported}");
 
     let mut unsupported_rules: Vec<&RuleReport> = reports.iter().filter(|r| !r.supported).collect();
-    unsupported_rules.sort_by(|a, b| a.reason.cmp(&b.reason));
+    unsupported_rules
+        .sort_by(|a, b| (a.reason.as_deref(), &a.rule).cmp(&(b.reason.as_deref(), &b.rule)));
     if !unsupported_rules.is_empty() {
         println!("\n=== UNSUPPORTED RULES ===");
         for r in unsupported_rules {
             println!(
-                "[{}] ({}) {}",
-                tags(r),
+                "{}({}) {}",
+                tag_prefix(r),
                 r.reason.as_deref().unwrap_or("?"),
                 r.rule
             );
@@ -218,8 +288,8 @@ fn print_report(reports: &[RuleReport], show_supported: bool) {
         println!("\n=== SUPPORTED RULES ===");
         for r in reports.iter().filter(|r| r.supported) {
             println!(
-                "[{}] [{}] {}",
-                tags(r),
+                "{}[{}] {}",
+                tag_prefix(r),
                 r.filter_type.unwrap_or("?"),
                 r.rule
             );
@@ -238,27 +308,33 @@ fn tags(r: &RuleReport) -> String {
         .join("+")
 }
 
+/// A `[tag+tag] ` prefix, or empty when the rule has no domain relations (match-all mode).
+fn tag_prefix(r: &RuleReport) -> String {
+    if r.relations.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", tags(r))
+    }
+}
+
 /// Render a deterministic markdown report. Output depends only on the inputs (rules,
 /// domains, source) so re-running on the same data yields identical bytes - safe to
 /// commit and diff.
-fn print_markdown(reports: &[RuleReport], domains: &[String], source: &str) {
+fn print_markdown(reports: &[RuleReport], domains: Option<&[String]>, source: &str) {
     let supported = reports.iter().filter(|r| r.supported).count();
     let unsupported = reports.len() - supported;
-    let targets = reports
-        .iter()
-        .filter(|r| r.relations.contains(&Relation::Target))
-        .count();
-    let scopes = reports
-        .iter()
-        .filter(|r| r.relations.contains(&Relation::Scope))
-        .count();
+    let domain_filtered = domains.is_some();
 
     println!("# adblock-rust filter compatibility\n");
 
     println!("| | |");
     println!("|---|---|");
     println!("| Source | {} |", md_text(source));
-    println!("| Domains | {} |", md_text(&domains.join(", ")));
+    let domains_label = match domains {
+        Some(d) => d.join(", "),
+        None => "all (no domain filter)".to_string(),
+    };
+    println!("| Domains | {} |", md_text(&domains_label));
     println!("| adblock-rust | {ADBLOCK_RUST_VERSION} |");
     println!(
         "| Tool | {} v{} |",
@@ -267,11 +343,26 @@ fn print_markdown(reports: &[RuleReport], domains: &[String], source: &str) {
     );
     println!();
 
-    println!(
-        "**{} matching rules** - {supported} supported, {unsupported} unsupported \
-         (target: {targets}, scope: {scopes}).\n",
-        reports.len()
-    );
+    if domain_filtered {
+        let targets = reports
+            .iter()
+            .filter(|r| r.relations.contains(&Relation::Target))
+            .count();
+        let scopes = reports
+            .iter()
+            .filter(|r| r.relations.contains(&Relation::Scope))
+            .count();
+        println!(
+            "**{} matching rules** - {supported} supported, {unsupported} unsupported \
+             (target: {targets}, scope: {scopes}).\n",
+            reports.len()
+        );
+    } else {
+        println!(
+            "**{} rules checked** - {supported} supported, {unsupported} unsupported.\n",
+            reports.len()
+        );
+    }
 
     let mut unsupported_rules: Vec<&RuleReport> = reports.iter().filter(|r| !r.supported).collect();
     unsupported_rules
@@ -280,16 +371,24 @@ fn print_markdown(reports: &[RuleReport], domains: &[String], source: &str) {
     if unsupported_rules.is_empty() {
         println!("_None._\n");
     } else {
-        println!("| Tags | Reason | Rule |");
-        println!("|---|---|---|");
-        for r in unsupported_rules {
-            println!(
-                "| {} | {} | {} |",
-                tags(r),
-                md_text(r.reason.as_deref().unwrap_or("?")),
-                md_code(&r.rule)
-            );
-        }
+        let headers: &[&str] = if domain_filtered {
+            &["Tags", "Reason", "Rule"]
+        } else {
+            &["Reason", "Rule"]
+        };
+        let rows: Vec<Vec<String>> = unsupported_rules
+            .iter()
+            .map(|r| {
+                let mut row = Vec::new();
+                if domain_filtered {
+                    row.push(tags(r));
+                }
+                row.push(md_text(r.reason.as_deref().unwrap_or("?")));
+                row.push(md_code(&r.rule));
+                row
+            })
+            .collect();
+        print_table(headers, &rows);
         println!();
     }
 
@@ -299,16 +398,32 @@ fn print_markdown(reports: &[RuleReport], domains: &[String], source: &str) {
     if supported_rules.is_empty() {
         println!("_None._");
     } else {
-        println!("| Tags | Type | Rule |");
-        println!("|---|---|---|");
-        for r in supported_rules {
-            println!(
-                "| {} | {} | {} |",
-                tags(r),
-                r.filter_type.unwrap_or("?"),
-                md_code(&r.rule)
-            );
-        }
+        let headers: &[&str] = if domain_filtered {
+            &["Tags", "Type", "Rule"]
+        } else {
+            &["Type", "Rule"]
+        };
+        let rows: Vec<Vec<String>> = supported_rules
+            .iter()
+            .map(|r| {
+                let mut row = Vec::new();
+                if domain_filtered {
+                    row.push(tags(r));
+                }
+                row.push(r.filter_type.unwrap_or("?").to_string());
+                row.push(md_code(&r.rule));
+                row
+            })
+            .collect();
+        print_table(headers, &rows);
+    }
+}
+
+fn print_table(headers: &[&str], rows: &[Vec<String>]) {
+    println!("| {} |", headers.join(" | "));
+    println!("|{}|", vec!["---"; headers.len()].join("|"));
+    for row in rows {
+        println!("| {} |", row.join(" | "));
     }
 }
 
@@ -322,26 +437,27 @@ fn md_code(s: &str) -> String {
 
 fn print_usage() {
     println!(
-        "{name} v{version} - check which filter-list rules for a set of domains are \
-supported by adblock-rust
+        "{name} v{version} - check which filter-list rules adblock-rust supports
 
 USAGE:
-    adblock-rust-compat-checker --domains LIST (--url URL | --file PATH) [OPTIONS]
+    adblock-rust-compat (--list NAME|URL | --file PATH) [--domains LIST] [OPTIONS]
 
-REQUIRED:
-    --domains LIST       Comma-separated domains to match (e.g. youtube.com,youtu.be)
-    --url URL            Fetch the filter list from URL
-    --file PATH          Read the filter list from a local file (alternative to --url)
+SOURCE (exactly one):
+    --list NAME|URL      ubo, easylist, easyprivacy, or an http(s) URL
+    --url URL            Raw URL (alias for --list URL)
+    --file PATH          Read the filter list from a local file
 
 OPTIONS:
+    --domains LIST       Comma-separated domains to match (e.g. youtube.com,youtu.be);
+                         omit to check every rule in the list
     --markdown           Emit a markdown report to stdout
     --json               Emit the full report as JSON to stdout
     --show-supported     Also list supported rules (text output only)
     -h, --help           Show this help
 
---file and --url are mutually exclusive. List registrable domains (e.g. example.com)
-for broad subdomain coverage, plus any specific subdomains used in cosmetic/$domain=
-scopes. See examples/youtube-defaults.txt for the YouTube/uBO values.",
+When --domains is given, list registrable domains (e.g. example.com) for broad subdomain
+coverage, plus any specific subdomains used in cosmetic/$domain= scopes.
+See examples/check-youtube.sh for the YouTube domain set.",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
     );
@@ -355,6 +471,18 @@ fn fatal(msg: &str) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_list_presets_and_urls() {
+        assert_eq!(resolve_list("ubo").unwrap(), UBO_URL);
+        assert_eq!(resolve_list("easylist").unwrap(), EASYLIST_URL);
+        assert_eq!(resolve_list("easyprivacy").unwrap(), EASYPRIVACY_URL);
+        assert_eq!(
+            resolve_list("https://example.com/list.txt").unwrap(),
+            "https://example.com/list.txt"
+        );
+        assert!(resolve_list("nonsense").is_err());
+    }
 
     #[test]
     fn supported_network_rule() {
