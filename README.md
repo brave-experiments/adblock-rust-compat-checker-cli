@@ -51,31 +51,34 @@ cargo build --release --locked
 
 ## Usage
 
-A filter list is required (`--list`, `--url`, or `--file`). `--domains` is optional;
-omit it to check every rule in the list.
+At least one source is required (`--list`, `--url`, or `--file`); multiple are combined
+and de-duplicated. `--domains` is optional; omit it to check every rule.
 
 ```sh
 # uBO's list, only YouTube-related rules:
 adblock-rust-compat --list ubo --domains "youtube.com,youtu.be,googlevideo.com"
 
-# EasyList, every rule:
-adblock-rust-compat --list easylist
+# uBO + EasyList combined, every rule:
+adblock-rust-compat --list ubo,easylist
+
+# Mix presets, raw URLs, and local files:
+adblock-rust-compat --list ubo --url https://example.com/custom.txt --file ./local.txt
 ```
 
 See `examples/`.
 
 | Flag | Description |
 |---|---|
-| `--list NAME\|URL` | Source: `ubo`, `easylist`, `easyprivacy`, or an http(s) URL |
-| `--url URL` | Raw URL (alias for `--list URL`) |
-| `--file PATH` | Read the filter list from a local file |
+| `--list NAMES\|URLS` | Sources: `ubo`, `easylist`, `easyprivacy`, or http(s) URLs; comma-separated and/or repeated |
+| `--url URL` | Raw URL (repeatable) |
+| `--file PATH` | Local file (repeatable) |
 | `--domains LIST` | Comma-separated domains to match; omit to check every rule |
 | `--markdown` | Emit a markdown report to stdout |
 | `--json` | Emit the full report as JSON to stdout |
 | `--show-supported` | Also list supported rules (text output only) |
 | `-h`, `--help` | Show help |
 
-Exactly one source (`--list`/`--url`/`--file`) is required.
+The `--list`/`--url`/`--file` sources are combined; at least one is required.
 
 Progress goes to stderr and the report to stdout, so
 `... --markdown > report.md` produces a clean file.

@@ -42,6 +42,17 @@ fn resolve_list(value: &str) -> Result<String, String> {
     }
 }
 
+/// Expand `--list` values (comma-separated and/or repeated) into individual tokens,
+/// trimmed, with empties dropped.
+fn list_tokens(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 #[derive(serde::Serialize)]
 struct RuleReport {
     rule: String,
@@ -135,37 +146,45 @@ fn main() {
             .position(|a| a == flag)
             .and_then(|i| args.get(i + 1).cloned())
     };
-    let list = value_of("--list");
-    let url = value_of("--url");
-    let file = value_of("--file");
-
-    let n_sources = [&list, &url, &file].iter().filter(|s| s.is_some()).count();
-    if n_sources == 0 {
-        fatal("a filter list is required: --list <ubo|easylist|easyprivacy|URL>, --url URL, or --file PATH");
-    }
-    if n_sources > 1 {
-        fatal("pass only one of --list, --url, or --file");
-    }
-
-    let (source_label, text) = if let Some(path) = &file {
-        (
-            format!("file {path}"),
-            std::fs::read_to_string(path)
-                .unwrap_or_else(|e| fatal(&format!("could not read {path}: {e}"))),
-        )
-    } else {
-        // `--list` (preset name or URL), or `--url` (raw URL alias).
-        let resolved = match (&list, &url) {
-            (Some(l), _) => resolve_list(l).unwrap_or_else(|e| fatal(&e)),
-            (_, Some(u)) => u.clone(),
-            _ => unreachable!(),
-        };
-        eprintln!("Fetching {resolved} ...");
-        (
-            resolved.clone(),
-            fetch_list(&resolved).unwrap_or_else(|e| fatal(&e)),
-        )
+    // All values passed to a repeatable flag (the arg following each occurrence).
+    let values_of = |flag: &str| -> Vec<String> {
+        args.iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == flag)
+            .filter_map(|(i, _)| args.get(i + 1).cloned())
+            .collect()
     };
+
+    // Sources can be combined: any mix of --file, --list (preset/URL; comma-separated
+    // and/or repeated), and --url (repeatable). Their rules are merged into one corpus
+    // (duplicates across lists are de-duplicated below).
+    let mut source_labels: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+
+    for path in values_of("--file") {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| fatal(&format!("could not read {path}: {e}")));
+        source_labels.push(format!("file {path}"));
+        texts.push(text);
+    }
+    for token in list_tokens(&values_of("--list")) {
+        let url = resolve_list(&token).unwrap_or_else(|e| fatal(&e));
+        eprintln!("Fetching {url} ...");
+        texts.push(fetch_list(&url).unwrap_or_else(|e| fatal(&e)));
+        source_labels.push(url);
+    }
+    for url in values_of("--url") {
+        eprintln!("Fetching {url} ...");
+        texts.push(fetch_list(&url).unwrap_or_else(|e| fatal(&e)));
+        source_labels.push(url);
+    }
+
+    if source_labels.is_empty() {
+        fatal("a filter list is required: --list <ubo|easylist|easyprivacy|URL ...>, --url URL, or --file PATH");
+    }
+
+    let source_label = source_labels.join(", ");
+    let text = texts.join("\n");
 
     // No --domains means "check every rule" (no domain filtering).
     let domains: Option<Vec<String>> = match value_of("--domains") {
@@ -440,12 +459,13 @@ fn print_usage() {
         "{name} v{version} - check which filter-list rules adblock-rust supports
 
 USAGE:
-    adblock-rust-compat (--list NAME|URL | --file PATH) [--domains LIST] [OPTIONS]
+    adblock-rust-compat <SOURCE>... [--domains LIST] [OPTIONS]
 
-SOURCE (exactly one):
-    --list NAME|URL      ubo, easylist, easyprivacy, or an http(s) URL
-    --url URL            Raw URL (alias for --list URL)
-    --file PATH          Read the filter list from a local file
+SOURCE (one or more; their rules are combined and de-duplicated):
+    --list NAMES|URLS    ubo, easylist, easyprivacy, or http(s) URLs; comma-separated
+                         and/or repeated (e.g. --list ubo,easylist)
+    --url URL            Raw URL (repeatable)
+    --file PATH          Local file (repeatable)
 
 OPTIONS:
     --domains LIST       Comma-separated domains to match (e.g. youtube.com,youtu.be);
@@ -482,6 +502,28 @@ mod tests {
             "https://example.com/list.txt"
         );
         assert!(resolve_list("nonsense").is_err());
+        // A stray flag captured as a value (e.g. `--list --json`) is rejected.
+        assert!(resolve_list("--json").is_err());
+    }
+
+    #[test]
+    fn list_tokens_split_and_repeat() {
+        // comma-separated, repeated, and a mix all expand to individual tokens
+        assert_eq!(
+            list_tokens(&["ubo,easylist".to_string()]),
+            vec!["ubo", "easylist"]
+        );
+        assert_eq!(
+            list_tokens(&["ubo".to_string(), "easylist".to_string()]),
+            vec!["ubo", "easylist"]
+        );
+        assert_eq!(
+            list_tokens(&[" ubo , easyprivacy ".to_string(), "easylist".to_string()]),
+            vec!["ubo", "easyprivacy", "easylist"]
+        );
+        // empties and stray commas are dropped
+        assert_eq!(list_tokens(&["ubo,,".to_string()]), vec!["ubo"]);
+        assert!(list_tokens(&[]).is_empty());
     }
 
     #[test]
